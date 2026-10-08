@@ -1,0 +1,751 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161413">
+<meta name="robots" content="noindex">
+<title>穿戴甲試戴測試</title>
+<!--
+  Test page for trying press-ons on from one photo. A dashed outline traced from a real hand shows the
+  pose; the user lines their hand up with it, so the nails can sit in fixed slots. Every nail then has
+  three points the user can drag to fix it. For a photo taken elsewhere, the page can look for the hand
+  itself (MediaPipe hand landmarks, run in the browser). data.js and nails/*.png come from ../make_guide.py.
+
+  ?edit opens the guide editor: drag the outline's nodes, add or remove nodes, and move the nail slots
+  over a photo, then save.
+  Saving needs ../serve.py (it writes template.json and data.js), so it only works on the machine that runs it.
+  Testing hook: add ?photo=relative/path.jpg to load a photo as if it had been picked; add &guided to treat it
+  as a photo taken with the guide.
+-->
+<style>
+  :root {
+    --ground: #161413; --stage: #2b2826; --ink: #f3efe9; --dim: #a39b92; --line: #4a4541;
+    --accent: #a9cbd8; --accent-ink: #10242c; --pick: #ffd166;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; background: var(--ground); color: var(--ink); }
+  body {
+    font: 15px/1.5 system-ui, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+    -webkit-text-size-adjust: 100%; overscroll-behavior: none;
+  }
+  .app {
+    min-height: 100vh; min-height: 100dvh; max-width: 560px; margin: 0 auto;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .app.editing { max-width: 900px; }
+
+  .stage {
+    position: relative; align-self: center; aspect-ratio: 3 / 4;
+    /* as large as the screen allows, leaving room for the buttons underneath */
+    width: min(100%, max(280px, calc((100vh - 190px) * 3 / 4))); width: min(100%, max(280px, calc((100dvh - 190px) * 3 / 4)));
+    background: var(--stage); border-radius: 14px; overflow: hidden;
+  }
+  /* everything that zooms together when a nail is picked */
+  .view { position: absolute; inset: 0; transform-origin: 50% 50%; transition: transform .18s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .view { transition: none; } }
+  .view video, .view canvas, .view svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .view video { object-fit: cover; }
+  .view video.mirror { transform: scaleX(-1); }
+  .view svg { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .hand path { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+  /* --z is the view's zoom: lines keep the same thickness on screen however far it is zoomed in */
+  .hand .under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
+  .hand .dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
+  .axis {
+    stroke: #fff; stroke-width: calc(1.5px / var(--z, 1)); stroke-dasharray: calc(4px / var(--z, 1)) calc(4px / var(--z, 1));
+    vector-effect: non-scaling-stroke; fill: none; opacity: .85;
+  }
+  .dot { fill: #fff; stroke: rgba(0, 0, 0, .6); stroke-width: calc(1.5px / var(--z, 1)); vector-effect: non-scaling-stroke; }
+  .dot.side { fill: var(--accent); }
+  .knot { fill: #fff; stroke: rgba(0, 0, 0, .7); stroke-width: calc(1.2px / var(--z, 1)); vector-effect: non-scaling-stroke; }
+  .knot.same { fill: var(--accent); }
+  .knot.on { fill: var(--pick); }
+  .ghost { fill: none; stroke: var(--pick); stroke-width: calc(2px / var(--z, 1)); vector-effect: non-scaling-stroke; pointer-events: none; }
+  .hint {
+    position: absolute; left: 10px; right: 10px; bottom: 10px; margin: 0; padding: 7px 11px;
+    background: rgba(18, 16, 15, .74); border-radius: 9px; font-size: 13.5px; text-align: center; pointer-events: none;
+  }
+
+  .tune { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 14px; font-size: 13.5px; color: var(--dim); }
+  .tune strong { color: var(--ink); font-weight: 600; }
+  .tune span { display: flex; gap: 14px; }
+  .tune .how { flex-basis: 100%; margin: 0; font-size: 12.5px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  button, .btn {
+    font: inherit; color: var(--ink); background: none; border: 1px solid var(--line); border-radius: 999px;
+    padding: 7px 14px; min-height: 38px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center;
+  }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.link { border: 0; padding: 0 2px; min-height: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+  .main {
+    align-self: center; min-width: 190px; justify-content: center; min-height: 48px; font-size: 16px; font-weight: 600;
+    background: var(--ink); color: var(--ground); border-color: var(--ink);
+  }
+  button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .note { margin: 0; text-align: center; font-size: 12.5px; color: var(--dim); }
+  .note.warn { color: #f0c9a0; }
+  .note.good { color: #b9dcb0; }
+
+  .result {
+    position: fixed; inset: 0; z-index: 5; background: rgba(12, 11, 10, .96);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: calc(14px + env(safe-area-inset-top, 0px)) 16px calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+  .result img { max-width: 100%; max-height: calc(100vh - 170px); max-height: calc(100dvh - 170px); border-radius: 12px; }
+</style>
+</head>
+<body>
+<main class="app" id="app">
+  <div class="stage" id="stage" data-mode="idle">
+    <div class="view" id="view">
+    <video id="cam" playsinline muted hidden></video>
+    <canvas id="photo" width="1200" height="1600" hidden></canvas>
+    <canvas id="paint" width="1200" height="1600"></canvas>
+    <svg id="overlay" viewBox="0 0 1200 1600" role="img" aria-label="手的虛線輪廓和五片甲片；拍照後，選中的那片有三個可以拖的點">
+      <g class="hand" id="hand"><path class="under"/><path class="dash"/></g>
+      <g id="knots" hidden></g>
+      <circle class="ghost" id="ghost" hidden/>
+      <g id="grips" hidden>
+        <line class="axis" id="gAxis"/><line class="axis" id="gArm"/>
+        <circle class="dot" id="gBase"/><circle class="dot" id="gTip"/><circle class="dot side" id="gSide"/>
+      </g>
+    </svg>
+    </div>
+    <p class="hint" id="hint" hidden></p>
+  </div>
+
+  <div class="tune" id="tune" hidden>
+    <strong id="tuneName"></strong>
+    <span><button class="link" id="tuneReset" type="button">還原這片</button><button class="link" id="tuneDrop" type="button">拿掉這片</button></span>
+    <p class="how" id="tuneHow">拖甲片移動位置。白點調長短和方向，藍點調寬度。點空白處縮回。</p>
+  </div>
+
+  <div class="row" id="editBar" hidden>
+    <button id="addKnot" type="button" aria-pressed="false">加節點</button>
+    <button id="dropKnot" type="button" disabled>刪節點</button>
+    <button id="zoomIn" type="button" aria-label="放大">放大</button>
+    <button id="zoomOut" type="button" aria-label="縮小">縮小</button>
+  </div>
+  <div class="row">
+    <button id="flipHand" type="button">換另一隻手</button>
+    <button id="toggleNails" type="button" aria-pressed="true" hidden>顯示甲片</button>
+    <button id="again" type="button" hidden>自動找指甲</button>
+    <button id="flipCam" type="button" hidden>換鏡頭</button>
+    <button id="pick" type="button">選一張照片</button>
+    <button id="retake" type="button" hidden>重來</button>
+    <a class="btn" id="toEdit" hidden>調整虛線</a>
+    <a class="btn" id="toShoot" href="./" hidden>回拍照頁</a>
+  </div>
+  <button class="main" id="main" type="button">開相機</button>
+  <p class="note" id="note">照片只在你的裝置上處理，不會上傳。</p>
+  <p class="note" id="about">測試版 · 甲片是示意款</p>
+  <input id="file" type="file" accept="image/*" hidden>
+</main>
+
+<div class="result" id="result" hidden>
+  <img id="resultImg" alt="試戴結果">
+  <p class="note">長按圖片可以存到相簿。</p>
+  <div class="row">
+    <a class="btn" id="download" download="nail-tryon.jpg">下載</a>
+    <button id="back" type="button">回去調整</button>
+  </div>
+</div>
+
+<script src="data.js"></script>
+<script>
+(function () {
+  var G = window.GUIDE, NAILS = G.nails, NS = 'http://www.w3.org/2000/svg';
+  var NAMES = { thumb: '拇指', index: '食指', middle: '中指', ring: '無名指', pinky: '小指' };
+  var ORDER = ['pinky', 'ring', 'middle', 'index', 'thumb'];            // paint order, the thumb goes on top
+  var TIP = { thumb: 4, index: 8, middle: 12, ring: 16, pinky: 20 };    // hand landmark at each fingertip
+  var BONES = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12],
+               [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [0, 17], [17, 18], [18, 19], [19, 20]];
+  var CW = G.w, CH = G.h;
+  var VISION = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+  var MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+  var POSE = '../src/hand_claw.webp';   // the photo the guide was traced from; it only exists on the machine that built it
+  // where a press-on starts and ends along the last finger segment (last joint = 0, fingertip landmark = 1),
+  // and how much wider than the natural nail it is. With the fingers curled towards the camera the fingertip
+  // landmark tends to land short of the real fingertip, so the nail reaches well past it.
+  var NAIL_FROM = 0.50, NAIL_TO = 1.28, NAIL_WIDER = 1.12;
+  var ZOOM = 2.2;
+  var HINTS = {
+    idle: '這是引導畫面。開相機後，把手擺成虛線的樣子。',
+    live: '手心朝自己、手指往內彎，放進虛線。指甲對到甲片就拍。',
+    finding: '正在找你的手…',
+    guide: '點一片甲片就會放大，可以拖到剛好。',
+    found: '位置是估的。點一片甲片就會放大，可以拖。',
+    lost: '找不到手，甲片先放在虛線的位置。點一片，把它拖到指甲上。'
+  };
+  var $ = function (id) { return document.getElementById(id); };
+  var query = new URLSearchParams(location.search);
+  var local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  var stage = $('stage'), cam = $('cam'), photo = $('photo'), paint = $('paint'), overlay = $('overlay'), view = $('view');
+  var pctx = photo.getContext('2d', { willReadFrequently: true }), xctx = paint.getContext('2d');
+  // a nail is two points and a width: b = middle of the cuticle edge, t = middle of the free edge
+  // found: null while looking for the hand, 'guide' = nails sit in the guide's slots, true / false = hand found or not
+  var state = { mode: 'idle', leftHand: true, show: true, selected: null, found: 'guide', facing: 'environment',
+                camMirror: false, stream: null, nails: {}, auto: {} };
+  // the guide editor: which line and node are picked, whether every click adds a node, and the view's zoom
+  var edit = query.has('edit') ? { line: null, knot: null, adding: false, s: 1, x: 0, y: 0 } : null;
+  var imgs = {}, tints = {}, resultUrl = null, detector = null;
+
+  ORDER.forEach(function (name) {
+    imgs[name] = new Image();
+    imgs[name].onload = render;
+    imgs[name].src = NAILS[name].src;
+  });
+
+  // ---- finding the hand ----
+  function loadDetector() {
+    if (!detector) {
+      detector = import(VISION + '/vision_bundle.mjs').then(function (m) {
+        return m.FilesetResolver.forVisionTasks(VISION + '/wasm').then(function (files) {
+          return m.HandLandmarker.createFromOptions(files, { baseOptions: { modelAssetPath: MODEL }, runningMode: 'IMAGE', numHands: 1 });
+        });
+      });
+      detector.catch(function () { detector = null; });   // let the next photo try again
+    }
+    return detector;
+  }
+  function between(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  // the guide's slots: the traced hand is a left hand, the right hand is its mirror image
+  function slots() {
+    var out = {};
+    Object.keys(G.slots).forEach(function (name) {
+      var s = G.slots[name], L = state.leftHand;
+      out[name] = { bx: L ? s.bx : CW - s.bx, by: s.by, tx: L ? s.tx : CW - s.tx, ty: s.ty, w: s.w };
+    });
+    return out;
+  }
+  function fromHand(lm, world) {
+    var P = lm.map(function (p) { return { x: p.x * CW, y: p.y * CH }; });
+    // pixels per metre: a bone lying flat to the camera shows its full length, a tilted one looks shorter,
+    // so take a high value among the bones rather than the average
+    var perMetre = between(P[5], P[17]) / 0.072;
+    if (world) {
+      var ratios = BONES.map(function (b) {
+        var u = world[b[0]], v = world[b[1]];
+        return between(P[b[0]], P[b[1]]) / (Math.hypot(u.x - v.x, u.y - v.y, u.z - v.z) || 1);
+      }).sort(function (a, b) { return a - b; });
+      perMetre = ratios[Math.floor(ratios.length * 0.8)];
+    }
+    var out = {};
+    Object.keys(TIP).forEach(function (name) {
+      var d = P[TIP[name] - 1], t = P[TIP[name]], vx = t.x - d.x, vy = t.y - d.y;
+      var w = NAILS[name].mm / 1000 * perMetre * NAIL_WIDER;
+      var n = { bx: d.x + vx * NAIL_FROM, by: d.y + vy * NAIL_FROM, tx: d.x + vx * NAIL_TO, ty: d.y + vy * NAIL_TO, w: w };
+      // a fingertip pointing straight at the camera leaves almost no length; keep the nail big enough to grab
+      var g = geo(n), least = w * 0.6;
+      if (g.len < least) {
+        n.bx = g.cx - g.ux * least / 2; n.by = g.cy - g.uy * least / 2;
+        n.tx = g.cx + g.ux * least / 2; n.ty = g.cy + g.uy * least / 2;
+      }
+      out[name] = n;
+    });
+    return out;
+  }
+  function setNails(nails) {
+    state.nails = nails;
+    state.auto = JSON.parse(JSON.stringify(nails));
+  }
+  function findHand() {
+    state.found = null;
+    select(null);
+    setNails({});
+    sync();
+    loadDetector().then(function (det) {
+      var res = det.detect(photo);
+      return res.landmarks && res.landmarks[0] ? fromHand(res.landmarks[0], res.worldLandmarks && res.worldLandmarks[0]) : null;
+    }).catch(function (err) {
+      console.warn('hand detection failed', err);
+      return null;
+    }).then(function (nails) {
+      if (state.mode !== 'still') return;
+      state.found = !!nails;
+      setNails(nails || slots());
+      sync();
+    });
+  }
+
+  // ---- drawing ----
+  function geo(n) {
+    var dx = n.tx - n.bx, dy = n.ty - n.by, len = Math.hypot(dx, dy) || 1;
+    return { cx: (n.bx + n.tx) / 2, cy: (n.by + n.ty) / 2, len: len, ux: dx / len, uy: dy / len,
+             ang: Math.atan2(dy, dx) - Math.PI / 2 };     // the image is stored cuticle-up, free edge down
+  }
+  // a smooth curve through a line's points (Catmull-Rom, written as cubic Beziers)
+  function curve(p) {
+    if (p.length < 2) return '';
+    var d = 'M' + p[0][0] + ' ' + p[0][1];
+    for (var i = 0; i < p.length - 1; i++) {
+      var a = p[Math.max(0, i - 1)], b = p[i], c = p[i + 1], e = p[Math.min(p.length - 1, i + 2)];
+      d += ' C' + (b[0] + (c[0] - a[0]) / 6).toFixed(1) + ' ' + (b[1] + (c[1] - a[1]) / 6).toFixed(1) + ' '
+                + (c[0] - (e[0] - b[0]) / 6).toFixed(1) + ' ' + (c[1] - (e[1] - b[1]) / 6).toFixed(1) + ' ' + c[0] + ' ' + c[1];
+    }
+    return d;
+  }
+  function drawGuide() {
+    var d = G.lines.map(curve).join(' ');
+    Array.prototype.forEach.call(document.querySelectorAll('#hand path'), function (el) { el.setAttribute('d', d); });
+  }
+  // the nail image, darkened or lightened to the light on that fingertip and tinted a little by its colour
+  function lit(name, n) {
+    var im = imgs[name], c = tints[name] || (tints[name] = document.createElement('canvas'));
+    c.width = im.naturalWidth; c.height = im.naturalHeight;
+    var x = c.getContext('2d'), g = geo(n), r = Math.max(6, Math.round(n.w * 0.3));
+    x.drawImage(im, 0, 0);
+    if (state.mode !== 'still' || photo.hidden) return c;
+    var x0 = Math.min(CW - 2, Math.max(0, Math.round(g.cx - r))), y0 = Math.min(CH - 2, Math.max(0, Math.round(g.cy - r)));
+    var d = pctx.getImageData(x0, y0, Math.min(r * 2, CW - x0), Math.min(r * 2, CH - y0)).data, R = 0, G = 0, B = 0;
+    for (var i = 0; i < d.length; i += 4) { R += d[i]; G += d[i + 1]; B += d[i + 2]; }
+    var k = 4 / d.length;
+    R *= k; G *= k; B *= k;
+    var f = Math.min(1.12, Math.max(0.55, (0.299 * R + 0.587 * G + 0.114 * B) / 165));
+    x.globalCompositeOperation = 'source-atop';
+    x.fillStyle = f < 1 ? 'rgba(20,12,8,' + (1 - f).toFixed(3) + ')' : 'rgba(255,248,240,' + ((f - 1) * 0.9).toFixed(3) + ')';
+    x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = 'rgba(' + Math.round(R) + ',' + Math.round(G) + ',' + Math.round(B) + ',0.08)';
+    x.fillRect(0, 0, c.width, c.height);
+    return c;
+  }
+  function paintNails(ctx, nails) {
+    ORDER.forEach(function (name) {
+      var n = nails[name];
+      if (!n || !imgs[name].naturalWidth) return;
+      var g = geo(n);
+      ctx.save();
+      ctx.translate(g.cx, g.cy);
+      ctx.rotate(g.ang);
+      ctx.shadowColor = 'rgba(40, 20, 10, .45)';
+      ctx.shadowBlur = Math.max(3, n.w * 0.06); ctx.shadowOffsetX = n.w * 0.015; ctx.shadowOffsetY = n.w * 0.03;
+      ctx.drawImage(lit(name, n), -n.w / 2, -g.len / 2, n.w, g.len);
+      ctx.restore();
+    });
+  }
+  function unit() { return CW / (overlay.getBoundingClientRect().width || CW); }   // drawing units per screen pixel
+  // the three points sit a little outside the nail, so they never cover it
+  function grips(n) {
+    var g = geo(n), o = 11 * unit(), half = n.w / 2 + o;
+    return { base: { x: n.bx - g.ux * o, y: n.by - g.uy * o }, tip: { x: n.tx + g.ux * o, y: n.ty + g.uy * o },
+             side: { x: g.cx - g.uy * half, y: g.cy + g.ux * half }, mid: { x: g.cx, y: g.cy } };
+  }
+  function render() {
+    xctx.clearRect(0, 0, CW, CH);
+    if (state.mode !== 'still') paintNails(xctx, slots());
+    else if (state.show) paintNails(xctx, state.nails);
+    if (edit) drawKnots();
+    var n = state.show && state.selected && state.nails[state.selected];
+    $('grips').toggleAttribute('hidden', !n);
+    if (!n) return;
+    var h = grips(n), r = 7 * unit();
+    $('gAxis').setAttribute('x1', h.base.x); $('gAxis').setAttribute('y1', h.base.y);
+    $('gAxis').setAttribute('x2', h.tip.x); $('gAxis').setAttribute('y2', h.tip.y);
+    $('gArm').setAttribute('x1', h.mid.x); $('gArm').setAttribute('y1', h.mid.y);
+    $('gArm').setAttribute('x2', h.side.x); $('gArm').setAttribute('y2', h.side.y);
+    [['gBase', h.base], ['gTip', h.tip], ['gSide', h.side]].forEach(function (p) {
+      $(p[0]).setAttribute('cx', p[1].x); $(p[0]).setAttribute('cy', p[1].y); $(p[0]).setAttribute('r', r);
+    });
+  }
+
+  // ---- mode and controls ----
+  function sync() {
+    var mode = state.mode, still = mode === 'still', n = state.selected;
+    stage.dataset.mode = mode;
+    cam.hidden = mode !== 'live';
+    $('hand').toggleAttribute('hidden', still && !edit);
+    $('hand').setAttribute('transform', state.leftHand ? '' : 'translate(' + CW + ' 0) scale(-1 1)');
+    $('flipHand').hidden = still;
+    $('flipCam').hidden = mode !== 'live';
+    $('pick').hidden = still && !edit;
+    $('retake').hidden = !still || !!edit;
+    $('toggleNails').hidden = !still;
+    $('again').hidden = !still || state.found === null || !!edit;
+    $('toEdit').hidden = !local || !!edit || mode !== 'idle';
+    $('main').textContent = edit ? '存檔' : mode === 'idle' ? '開相機' : mode === 'live' ? '拍照' : '存圖';
+    $('main').disabled = still && state.found === null;
+    // once a nail is picked the instructions move under the picture, so nothing covers the zoomed view
+    var hint = edit ? '' : !still ? HINTS[mode] : n ? '' : state.found === null ? HINTS.finding
+             : state.found === 'guide' ? HINTS.guide : state.found ? HINTS.found : HINTS.lost;
+    $('hint').textContent = hint;
+    $('hint').hidden = !hint;
+    $('tune').hidden = !n;
+    if (n) $('tuneName').textContent = NAMES[n];
+    if (edit) {
+      $('addKnot').setAttribute('aria-pressed', String(edit.adding));
+      $('dropKnot').disabled = edit.knot === null;
+    }
+    render();
+  }
+  function setMode(mode) { state.mode = mode; sync(); }
+  // picking a nail zooms in on it: on a phone a nail is only a few millimetres across.
+  // The editor has its own zoom, so it leaves the view alone.
+  function select(name) {
+    var n = name && state.nails[name];
+    if (name !== state.selected && !edit) {
+      if (n) { var g = geo(n); view.style.transformOrigin = (g.cx / CW * 100) + '% ' + (g.cy / CH * 100) + '%'; }
+      view.style.transform = n ? 'scale(' + ZOOM + ')' : '';
+      view.style.setProperty('--z', n ? ZOOM : 1);
+    }
+    if (edit && name) { edit.line = null; edit.knot = null; }
+    state.selected = name;
+    sync();
+  }
+  function say(text, tone) {
+    $('note').textContent = text;
+    $('note').className = 'note' + (tone ? ' ' + tone : '');
+  }
+
+  // ---- camera ----
+  function stopCam() {
+    if (state.stream) state.stream.getTracks().forEach(function (t) { t.stop(); });
+    state.stream = null;
+    cam.srcObject = null;
+  }
+  function startCam() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say('這個瀏覽器開不了相機。改用「選一張照片」。', 'warn');
+      return;
+    }
+    stopCam();
+    navigator.mediaDevices.getUserMedia({ audio: false,
+      video: { facingMode: { ideal: state.facing }, width: { ideal: 1920 }, height: { ideal: 1440 } } })
+      .then(function (stream) {
+        state.stream = stream;
+        cam.srcObject = stream;
+        // only the back camera shows the scene as it is; anything else is shown like a mirror
+        state.camMirror = stream.getVideoTracks()[0].getSettings().facingMode !== 'environment';
+        cam.classList.toggle('mirror', state.camMirror);
+        select(null);
+        setMode('live');
+        say('照片只在你的裝置上處理，不會上傳。');
+        return cam.play();
+      })
+      .catch(function (err) {
+        say(err.name === 'NotAllowedError' ? '相機權限沒開。到瀏覽器設定允許相機，或改用「選一張照片」。'
+                                           : '相機開不起來（' + err.name + '）。改用「選一張照片」。', 'warn');
+      });
+  }
+  // fill the 3:4 canvas from the centre of the source, the way object-fit: cover shows it
+  function cover(src, sw, sh, mirror) {
+    var b = Math.max(CW / sw, CH / sh), dw = sw * b, dh = sh * b;
+    pctx.save();
+    if (mirror) { pctx.translate(CW, 0); pctx.scale(-1, 1); }
+    pctx.drawImage(src, (CW - dw) / 2, (CH - dh) / 2, dw, dh);
+    pctx.restore();
+    photo.hidden = false;
+  }
+  // a photo taken with the guide: the hand is where the outline was, so the nails go in its slots
+  function shoot() {
+    if (!cam.videoWidth) return;
+    cover(cam, cam.videoWidth, cam.videoHeight, state.camMirror);
+    stopCam();
+    state.found = 'guide';
+    setNails(slots());
+    setMode('still');
+  }
+  // a photo from the library was not lined up with the guide, so look for the hand in it.
+  // In the editor a photo is only the backdrop the guide is adjusted against.
+  function loadPicked(url, guided) {
+    var im = new Image();
+    im.onload = function () {
+      stopCam();
+      cover(im, im.naturalWidth, im.naturalHeight, false);
+      if (edit) { render(); return; }
+      if (guided) { state.found = 'guide'; setNails(slots()); }
+      setMode('still');
+      if (!guided) findHand();
+    };
+    im.onerror = function () { say(edit ? '底圖讀不進來。可以按「選一張照片」放一張手的照片當底。' : '這張照片讀不進來，換一張試試。', 'warn'); };
+    im.src = url;
+  }
+
+  // ---- result ----
+  function save() {
+    var c = document.createElement('canvas'), x = c.getContext('2d');
+    c.width = CW; c.height = CH;
+    x.drawImage(photo, 0, 0);
+    if (state.show) paintNails(x, state.nails);
+    c.toBlob(function (blob) {
+      if (!blob) { say('圖存不出來，重拍一次試試。', 'warn'); return; }
+      if (resultUrl) URL.revokeObjectURL(resultUrl);
+      resultUrl = URL.createObjectURL(blob);
+      $('resultImg').src = resultUrl;
+      $('download').href = resultUrl;
+      $('result').hidden = false;
+    }, 'image/jpeg', 0.92);
+  }
+
+  // ---- the guide editor ----
+  function drawKnots() {
+    var g = $('knots'), r = 3.5 * unit(), need = 0;
+    G.lines.forEach(function (ln, i) {
+      ln.forEach(function (p, j) {
+        var c = g.children[need++] || g.appendChild(document.createElementNS(NS, 'circle'));
+        c.setAttribute('cx', p[0]); c.setAttribute('cy', p[1]);
+        c.setAttribute('r', i === edit.line && j === edit.knot ? r * 1.5 : r);
+        c.setAttribute('class', 'knot' + (i === edit.line ? j === edit.knot ? ' on' : ' same' : ''));
+      });
+    });
+    while (g.children.length > need) g.removeChild(g.lastChild);
+  }
+  function placeView() {
+    view.style.transition = 'none';
+    view.style.transformOrigin = '0 0';
+    view.style.transform = 'translate(' + edit.x + 'px,' + edit.y + 'px) scale(' + edit.s + ')';
+    view.style.setProperty('--z', edit.s);
+    render();
+  }
+  // zoom about a point of the stage (in screen pixels from its corner), keeping that point still
+  function zoomAt(cx, cy, factor) {
+    var s = Math.min(10, Math.max(1, edit.s * factor));
+    edit.x = cx - (cx - edit.x) * s / edit.s;
+    edit.y = cy - (cy - edit.y) * s / edit.s;
+    edit.s = s;
+    if (s === 1) { edit.x = 0; edit.y = 0; }
+    placeView();
+  }
+  // the spot on the drawn outline closest to p: which line, after which node, and where on the curve
+  function nearest(p) {
+    var best = null;
+    G.lines.forEach(function (ln, i) {
+      for (var j = 0; j < ln.length - 1; j++) {
+        var a = ln[Math.max(0, j - 1)], b = ln[j], c = ln[j + 1], e = ln[Math.min(ln.length - 1, j + 2)];
+        var c1 = [b[0] + (c[0] - a[0]) / 6, b[1] + (c[1] - a[1]) / 6], c2 = [c[0] - (e[0] - b[0]) / 6, c[1] - (e[1] - b[1]) / 6];
+        for (var k = 1; k < 12; k++) {
+          var t = k / 12, m = 1 - t;
+          var x = m * m * m * b[0] + 3 * m * m * t * c1[0] + 3 * m * t * t * c2[0] + t * t * t * c[0];
+          var y = m * m * m * b[1] + 3 * m * m * t * c1[1] + 3 * m * t * t * c2[1] + t * t * t * c[1];
+          var d = Math.hypot(x - p.x, y - p.y);
+          if (!best || d < best.d) best = { line: i, after: j, x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, d: d };
+        }
+      }
+    });
+    return best;
+  }
+  // what is under the pointer on the outline: a node, or a spot on the line where a node can be added.
+  // With "add node" on, the closest spot counts however far away it is.
+  function onGuide(p) {
+    var best = null, reach = 11 * unit();
+    G.lines.forEach(function (ln, i) {
+      ln.forEach(function (q, j) {
+        var d = Math.hypot(q[0] - p.x, q[1] - p.y);
+        if (d < reach) { reach = d; best = { line: i, knot: j }; }
+      });
+    });
+    if (best) return best;
+    var n = nearest(p);
+    return n && (edit.adding || n.d < 12 * unit()) ? n : null;
+  }
+  function pickKnot(line, knot) {
+    edit.line = line; edit.knot = knot;
+    state.selected = null;
+    sync();
+  }
+  // a line keeps at least two nodes, so it cannot be deleted away by accident
+  function dropKnot() {
+    if (edit.knot === null) return;
+    var ln = G.lines[edit.line];
+    if (ln.length <= 2) { say('這條線只剩兩個節點，不能再刪。', 'warn'); return; }
+    ln.splice(edit.knot, 1);
+    pickKnot(edit.line, Math.min(edit.knot, ln.length - 1));
+    drawGuide();
+  }
+  function saveGuide() {
+    fetch('template', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ lines: G.lines, slots: G.slots }) })
+      .then(function (r) {
+        if (!r.ok) throw new Error(r.status);
+        say('已存檔。拍照頁現在用的就是這個虛線。', 'good');
+      })
+      .catch(function () { say('存不了。調整虛線只能在自己電腦上的測試頁做。', 'warn'); });
+  }
+  function startEditor() {
+    $('app').classList.add('editing');
+    $('editBar').hidden = false;
+    $('toShoot').hidden = false;
+    $('tuneDrop').hidden = true;
+    $('tuneHow').textContent = '拖甲片移動位置。白點調長短和方向，藍點調寬度。';
+    $('about').textContent = '拖白點（節點）移動虛線。游標移到虛線上會出現黃圈，點下去就多一個節點。滾輪放大，拖空白處移動畫面。';
+    $('pick').textContent = '換底圖';
+    say('調整完按「存檔」。');
+    state.mode = 'still';
+    state.found = 'guide';
+    state.nails = G.slots;                                   // the editor moves the slots themselves
+    state.auto = JSON.parse(JSON.stringify(G.slots));
+    $('knots').removeAttribute('hidden');
+    sync();
+    placeView();
+    loadPicked(query.get('photo') || POSE);
+    stage.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var b = stage.getBoundingClientRect();
+      zoomAt(e.clientX - b.left, e.clientY - b.top, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+    }, { passive: false });
+    document.addEventListener('keydown', function (e) {
+      if ((e.key === 'Delete' || e.key === 'Backspace') && edit.knot !== null) { e.preventDefault(); dropKnot(); }
+      else if (e.key === 'Escape' && edit.adding) { edit.adding = false; sync(); }
+    });
+    $('addKnot').addEventListener('click', function () {
+      edit.adding = !edit.adding;
+      say(edit.adding ? '現在每點一下，離游標最近的虛線上就多一個節點。再按一次「加節點」關掉。' : '調整完按「存檔」。');
+      sync();
+    });
+    $('dropKnot').addEventListener('click', dropKnot);
+    overlay.addEventListener('pointerleave', function () { $('ghost').setAttribute('hidden', ''); });
+    $('zoomIn').addEventListener('click', function () { var b = stage.getBoundingClientRect(); zoomAt(b.width / 2, b.height / 2, 1.5); });
+    $('zoomOut').addEventListener('click', function () { var b = stage.getBoundingClientRect(); zoomAt(b.width / 2, b.height / 2, 1 / 1.5); });
+  }
+
+  // ---- dragging: a point of the selected nail, a whole nail, and in the editor the outline's points and the view ----
+  var drag = null;
+  function at(e) {
+    var b = overlay.getBoundingClientRect();
+    return { x: (e.clientX - b.left) * CW / b.width, y: (e.clientY - b.top) * CH / b.height };
+  }
+  function covers(n, p, pad) {
+    var g = geo(n), dx = p.x - g.cx, dy = p.y - g.cy;
+    return Math.abs(dx * -g.uy + dy * g.ux) <= n.w / 2 + pad && Math.abs(dx * g.ux + dy * g.uy) <= g.len / 2 + pad;
+  }
+  function onNail(p) {
+    var hit = null, sel = state.selected && state.nails[state.selected];
+    if (sel) {
+      var h = grips(sel), reach = 24 * unit();
+      ['side', 'tip', 'base'].forEach(function (k) {
+        var d = between(h[k], p);
+        if (d < reach) { reach = d; hit = { kind: k, name: state.selected }; }
+      });
+    }
+    for (var i = ORDER.length - 1; i >= 0 && !hit; i--) {
+      var n = state.nails[ORDER[i]];
+      if (n && covers(n, p, 8 * unit())) hit = { kind: 'move', name: ORDER[i] };
+    }
+    return hit;
+  }
+  function editDown(e, p) {
+    var hit = state.show ? onNail(p) : null, g = onGuide(p);
+    $('ghost').setAttribute('hidden', '');
+    // a nail's own points win; then the outline's nodes; then the nail's body; then a spot on the outline
+    if (hit && hit.kind !== 'move') return hit;
+    if (g && g.knot !== undefined) { pickKnot(g.line, g.knot); return { kind: 'knot' }; }
+    if (hit && !edit.adding) { if (hit.name !== state.selected) { select(hit.name); return null; } return hit; }
+    if (g) {
+      G.lines[g.line].splice(g.after + 1, 0, [g.x, g.y]);
+      pickKnot(g.line, g.after + 1);
+      drawGuide();
+      return { kind: 'knot' };
+    }
+    edit.line = null; edit.knot = null;
+    select(null);
+    return { kind: 'pan', sx: e.clientX, sy: e.clientY };
+  }
+  // in the editor, a yellow ring shows where a click would add a node
+  function hover(e) {
+    var g = onGuide(at(e)), ring = $('ghost');
+    if (!g || g.knot !== undefined) { ring.setAttribute('hidden', ''); return; }
+    ring.setAttribute('cx', g.x); ring.setAttribute('cy', g.y); ring.setAttribute('r', 6 * unit());
+    ring.removeAttribute('hidden');
+  }
+  overlay.addEventListener('pointerdown', function (e) {
+    if (state.mode !== 'still' || state.found === null || (!state.show && !edit)) return;
+    var p = at(e), hit;
+    if (edit) hit = editDown(e, p);
+    else {
+      hit = onNail(p);
+      if (!hit) { select(null); return; }
+      // the first touch on another nail only picks it (the view is about to zoom); the next one drags
+      if (hit.name !== state.selected) { select(hit.name); return; }
+    }
+    if (!hit) return;
+    drag = hit;
+    hit.last = p;
+    overlay.setPointerCapture(e.pointerId);
+  });
+  overlay.addEventListener('pointermove', function (e) {
+    if (!drag) { if (edit) hover(e); return; }
+    if (drag.kind === 'pan') {
+      edit.x += e.clientX - drag.sx; edit.y += e.clientY - drag.sy;
+      drag.sx = e.clientX; drag.sy = e.clientY;
+      placeView();
+      return;
+    }
+    var p = at(e), dx = p.x - drag.last.x, dy = p.y - drag.last.y, n = state.nails[drag.name];
+    drag.last = p;
+    if (drag.kind === 'knot') {
+      var q = G.lines[edit.line][edit.knot];
+      q[0] = Math.round((q[0] + dx) * 10) / 10; q[1] = Math.round((q[1] + dy) * 10) / 10;
+      drawGuide();
+    }
+    else if (drag.kind === 'move') { n.bx += dx; n.by += dy; n.tx += dx; n.ty += dy; }
+    else if (drag.kind === 'base' && Math.hypot(n.tx - n.bx - dx, n.ty - n.by - dy) > 12) { n.bx += dx; n.by += dy; }
+    else if (drag.kind === 'tip' && Math.hypot(n.tx + dx - n.bx, n.ty + dy - n.by) > 12) { n.tx += dx; n.ty += dy; }
+    else if (drag.kind === 'side') {
+      // moving the point away from the nail's centre line widens it by twice as much
+      var g = geo(n);
+      n.w = Math.max(16, n.w + 2 * (dx * -g.uy + dy * g.ux));
+    }
+    render();
+  });
+  function lift() { drag = null; }
+  overlay.addEventListener('pointerup', lift);
+  overlay.addEventListener('pointercancel', lift);
+
+  // ---- buttons ----
+  $('main').addEventListener('click', function () {
+    if (edit) saveGuide(); else if (state.mode === 'idle') startCam(); else if (state.mode === 'live') shoot(); else save();
+  });
+  $('toggleNails').addEventListener('click', function () {
+    state.show = !state.show;
+    this.setAttribute('aria-pressed', String(state.show));
+    sync();
+  });
+  $('again').addEventListener('click', findHand);
+  $('flipHand').addEventListener('click', function () {
+    state.leftHand = !state.leftHand;
+    sync();
+  });
+  $('flipCam').addEventListener('click', function () {
+    state.facing = state.facing === 'environment' ? 'user' : 'environment';
+    startCam();
+  });
+  $('pick').addEventListener('click', function () {
+    if (!edit) loadDetector().catch(function () {});   // start fetching the model while the user chooses
+    $('file').click();
+  });
+  $('file').addEventListener('change', function () {
+    if (this.files && this.files[0]) loadPicked(URL.createObjectURL(this.files[0]));
+    this.value = '';
+  });
+  $('retake').addEventListener('click', function () {
+    select(null);
+    state.show = true;
+    $('toggleNails').setAttribute('aria-pressed', 'true');
+    photo.hidden = true;
+    setMode('idle');
+  });
+  $('tuneReset').addEventListener('click', function () {
+    var a = state.auto[state.selected];
+    if (a) Object.assign(state.nails[state.selected], a);
+    render();
+  });
+  $('tuneDrop').addEventListener('click', function () {
+    delete state.nails[state.selected];
+    select(null);
+  });
+  $('back').addEventListener('click', function () { $('result').hidden = true; });
+  window.addEventListener('resize', render);
+  $('toEdit').href = '?edit';
+
+  drawGuide();
+  sync();
+  var q = query.get('photo');
+  if (edit) { window.tryOn = { state: state, edit: edit, guide: G }; startEditor(); }
+  else if (q) { window.tryOn = state; loadPicked(q, query.has('guided')); }   // the hook also exposes the state for checks
+})();
+</script>
+</body>
+</html>
