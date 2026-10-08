@@ -54,10 +54,11 @@
   /* --z is the view's zoom: lines keep the same thickness on screen however far it is zoomed in */
   .hand .under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
   .hand .dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
-  /* where each nail goes: a blue dashed frame, like the ones drawn on the pose photo */
-  .slot { fill: none; vector-effect: non-scaling-stroke; }
-  .slot.under { stroke: rgba(0, 0, 0, .45); stroke-width: calc(4px / var(--z, 1)); }
-  .slot.dash { stroke: #7db8ff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(6px / var(--z, 1)) calc(5px / var(--z, 1)); }
+  /* where each nail goes: a dashed frame drawn like the hand's lines; blue only in the editor, to tell them apart */
+  .slot { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+  .slot.under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
+  .slot.dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
+  .editing .slot.dash { stroke: #7db8ff; }
   .axis {
     stroke: #fff; stroke-width: calc(1.5px / var(--z, 1)); stroke-dasharray: calc(4px / var(--z, 1)) calc(4px / var(--z, 1));
     vector-effect: non-scaling-stroke; fill: none; opacity: .85;
@@ -178,9 +179,11 @@
   // landmark tends to land short of the real fingertip, so the nail reaches well past it.
   var NAIL_FROM = 0.50, NAIL_TO = 1.28, NAIL_WIDER = 1.12;
   var ZOOM = 2.2;
+  // the frame of a nail nobody drew an outline for: a rounded box (across: -0.5 .. 0.5, along: 0 .. 1)
+  var BOX = [[-0.5, 0.25], [-0.32, 0.03], [0, 0], [0.32, 0.03], [0.5, 0.25], [0.5, 0.75], [0.32, 0.97], [0, 1], [-0.32, 0.97], [-0.5, 0.75]];
   var HINTS = {
     idle: '這是引導畫面。開相機後，把手擺成虛線的樣子。',
-    live: '手心朝自己、手指往內彎，放進虛線。指甲對到藍色框就拍。',
+    live: '手心朝自己、手指往內彎，放進虛線。指甲對到指甲的框就拍。',
     finding: '正在找你的手…',
     guide: '點一片甲片就會放大，可以拖到剛好。',
     found: '位置是估的。點一片甲片就會放大，可以拖。',
@@ -339,23 +342,37 @@
     return { base: { x: n.bx - g.ux * o, y: n.by - g.uy * o }, tip: { x: n.tx + g.ux * o, y: n.ty + g.uy * o },
              side: { x: g.cx - g.uy * half, y: g.cy + g.ux * half }, mid: { x: g.cx, y: g.cy } };
   }
-  // the blue frames of the guide: one per nail, in the guide's slots (or, in the editor, wherever they were moved)
+  // a closed smooth curve through points (Catmull-Rom again, wrapping round)
+  function loop(p) {
+    var n = p.length, d = 'M' + p[0][0].toFixed(1) + ' ' + p[0][1].toFixed(1);
+    for (var i = 0; i < n; i++) {
+      var a = p[(i + n - 1) % n], b = p[i], c = p[(i + 1) % n], e = p[(i + 2) % n];
+      d += ' C' + (b[0] + (c[0] - a[0]) / 6).toFixed(1) + ' ' + (b[1] + (c[1] - a[1]) / 6).toFixed(1) + ' '
+                + (c[0] - (e[0] - b[0]) / 6).toFixed(1) + ' ' + (c[1] - (e[1] - b[1]) / 6).toFixed(1) + ' '
+                + c[0].toFixed(1) + ' ' + c[1].toFixed(1);
+    }
+    return d + 'Z';
+  }
+  // the frames of the guide: one per nail, in the guide's slots (or, in the editor, wherever they were moved).
+  // A frame is the outline that was drawn for that nail, kept in the slot's own measure so it moves with the slot;
+  // a nail without a drawn outline gets a rounded box.
   function drawFrames() {
     var g = $('frames'), show = state.mode !== 'still' || !!edit, where = edit ? state.nails : slots();
+    var flip = !edit && !state.leftHand ? -1 : 1;      // the right hand is the mirror image
     g.toggleAttribute('hidden', !show);
     if (!show) return;
     ORDER.forEach(function (name, i) {
-      var n = where[name];
+      var n = where[name], d = '';
+      if (n) {
+        var q = geo(n), shape = (G.shapes && G.shapes[name]) || BOX;
+        d = loop(shape.map(function (s) {
+          return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0] * flip, n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0] * flip];
+        }));
+      }
       ['under', 'dash'].forEach(function (kind, k) {
-        var el = g.children[i * 2 + k] || g.appendChild(document.createElementNS(NS, 'rect'));
+        var el = g.children[i * 2 + k] || g.appendChild(document.createElementNS(NS, 'path'));
         el.setAttribute('class', 'slot ' + kind);
-        el.toggleAttribute('hidden', !n);
-        if (!n) return;
-        var q = geo(n);
-        el.setAttribute('transform', 'translate(' + q.cx.toFixed(1) + ' ' + q.cy.toFixed(1) + ') rotate(' + (q.ang * 180 / Math.PI).toFixed(1) + ')');
-        el.setAttribute('x', -n.w / 2); el.setAttribute('y', -q.len / 2);
-        el.setAttribute('width', n.w); el.setAttribute('height', q.len);
-        el.setAttribute('rx', Math.min(n.w, q.len) * 0.3);
+        el.setAttribute('d', d);
       });
     });
   }
@@ -586,7 +603,7 @@
   }
   function saveGuide() {
     fetch('template', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ lines: G.lines, slots: G.slots }) })
+                        body: JSON.stringify({ lines: G.lines, slots: G.slots, shapes: G.shapes || {} }) })
       .then(function (r) {
         if (!r.ok) throw new Error(r.status);
         say('已存檔。拍照頁現在用的就是這個虛線。', 'good');
