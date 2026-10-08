@@ -9,7 +9,9 @@
 <!--
   Test page for trying press-ons on from one photo. A dashed outline traced from a real hand shows the
   pose; the user lines their hand up with it, so the nails can sit in fixed slots. Every nail then has
-  three points the user can drag to fix it. For a photo taken elsewhere, the page can look for the hand
+  three points the user can drag to fix it. While the camera is on, the page checks whether the hand is on the
+  guide (the guide's lines fitted to the edges in the picture) and then takes the photo by itself; the same fit
+  moves the nails to where the hand really was. For a photo taken elsewhere, the page can look for the hand
   itself (MediaPipe hand landmarks, run in the browser). data.js and nails/*.png come from ../make_guide.py.
 
   ?edit opens the guide editor: drag the outline's nodes, add or remove nodes, and move the nail slots
@@ -59,6 +61,8 @@
   .slot.under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
   .slot.dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
   .editing .slot.dash { stroke: #7db8ff; }
+  /* the hand is on the guide and the photo is about to be taken */
+  .stage[data-lock="on"] .hand .dash, .stage[data-lock="on"] .slot.dash { stroke: #8df0b0; }
   .axis {
     stroke: #fff; stroke-width: calc(1.5px / var(--z, 1)); stroke-dasharray: calc(4px / var(--z, 1)) calc(4px / var(--z, 1));
     vector-effect: non-scaling-stroke; fill: none; opacity: .85;
@@ -147,6 +151,7 @@
     <a class="btn" id="toShoot" href="./" hidden>回拍照頁</a>
   </div>
   <button class="main" id="main" type="button">開相機</button>
+  <p class="note" id="autoLine" hidden><span id="autoText"></span> <button class="link" id="autoShot" type="button"></button></p>
   <p class="note" id="note">照片只在你的裝置上處理，不會上傳。</p>
   <p class="note" id="about">測試版 · 甲片是示意款</p>
   <input id="file" type="file" accept="image/*" hidden>
@@ -181,9 +186,21 @@
   var ZOOM = 2.2;
   // the frame of a nail nobody drew an outline for: a rounded box (across: -0.5 .. 0.5, along: 0 .. 1)
   var BOX = [[-0.5, 0.25], [-0.32, 0.03], [0, 0], [0.32, 0.03], [0.5, 0.25], [0.5, 0.75], [0.32, 0.97], [0, 1], [-0.32, 0.97], [-0.5, 0.75]];
+  // "the hand is on the guide": the guide's lines are fitted to the edges in a small grey copy of the camera picture
+  var GW = 300, GH = 400, GK = CW / GW;               // the grey copy, and how many guide units one of its pixels covers
+  var STEP = 14, EDGE_MIN = 10;                       // a point every STEP units; the least step in brightness that counts as an edge
+  var REACH = [64, 28], NEAR = 12;                    // how far a point looks for its edge, pass by pass; how near counts as "on" it
+  var ON = 0.72;                                      // share of the guide that has to lie on edges
+  var OFF_MAX = 48, SIZE_MAX = 0.07, TURN_MAX = 6;    // how far off the hand may be: units, share of its size, degrees
+  var HOLD = 600, ARM = 1200, EVERY = 90;             // ms: stay on the guide this long; wait after the camera starts; between looks
   var HINTS = {
     idle: '這是引導畫面。開相機後，把手擺成虛線的樣子。',
-    live: '手心朝自己、手指往內彎，放進虛線。指甲對到指甲的框就拍。',
+    live: '手心朝自己、手指往內彎，放進虛線。對到了會自己拍。',
+    manual: '手心朝自己、手指往內彎，放進虛線。指甲對到指甲的框就拍。',
+    near: '快對到了，再調一點。',
+    closer: '手再靠近一點。', farther: '手再遠一點。',
+    left: '手往左一點。', right: '手往右一點。', up: '手往上一點。', down: '手往下一點。',
+    hold: '對到了，停住…',
     finding: '正在找你的手…',
     guide: '點一片甲片就會放大，可以拖到剛好。',
     found: '位置是估的。點一片甲片就會放大，可以拖。',
@@ -197,10 +214,17 @@
   // a nail is two points and a width: b = middle of the cuticle edge, t = middle of the free edge
   // found: null while looking for the hand, 'guide' = nails sit in the guide's slots, true / false = hand found or not
   var state = { mode: 'idle', leftHand: true, show: true, selected: null, found: 'guide', facing: 'environment',
-                camMirror: false, stream: null, nails: {}, auto: {} };
+                camMirror: false, stream: null, nails: {}, auto: {}, autoShot: true };
   // the guide editor: which line and node are picked, whether every click adds a node, and the view's zoom
   var edit = query.has('edit') ? { line: null, knot: null, adding: false, s: 1, x: 0, y: 0 } : null;
   var imgs = {}, tints = {}, resultUrl = null, detector = null;
+  // watching the camera for the hand: the timer, since when the hand has been on the guide, when watching starts to
+  // count, the last fit, and the guide's sample points (kept per hand, the right hand is the mirror image)
+  var lock = { timer: null, since: 0, armed: 0, last: null, samples: null, left: null };
+  var small = document.createElement('canvas'), sctx;
+  small.width = GW; small.height = GH;
+  sctx = small.getContext('2d', { willReadFrequently: true });
+  try { state.autoShot = localStorage.getItem('autoShot') !== '0'; } catch (e) {}
 
   ORDER.forEach(function (name) {
     imgs[name] = new Image();
@@ -426,6 +450,9 @@
     $('hand').setAttribute('transform', state.leftHand ? '' : 'translate(' + CW + ' 0) scale(-1 1)');
     $('flipHand').hidden = still;
     $('flipCam').hidden = mode !== 'live';
+    $('autoLine').hidden = mode !== 'live';
+    $('autoText').textContent = state.autoShot ? '手對到虛線、停住，就會自己拍。' : '自動拍已關，要自己按「拍照」。';
+    $('autoShot').textContent = state.autoShot ? '關掉自動拍' : '打開自動拍';
     $('pick').hidden = still && !edit;
     $('retake').hidden = !still || !!edit;
     $('toggleNails').hidden = !still;
@@ -434,7 +461,7 @@
     $('main').textContent = edit ? '存檔' : mode === 'idle' ? '開相機' : mode === 'live' ? '拍照' : '存圖';
     $('main').disabled = still && state.found === null;
     // once a nail is picked the instructions move under the picture, so nothing covers the zoomed view
-    var hint = edit ? '' : !still ? HINTS[mode] : n ? '' : state.found === null ? HINTS.finding
+    var hint = edit ? '' : !still ? HINTS[mode === 'live' && !state.autoShot ? 'manual' : mode] : n ? '' : state.found === null ? HINTS.finding
              : state.found === 'guide' ? HINTS.guide : state.found ? HINTS.found : HINTS.lost;
     $('hint').textContent = hint;
     $('hint').hidden = !hint;
@@ -444,6 +471,7 @@
       $('addKnot').setAttribute('aria-pressed', String(edit.adding));
       $('dropKnot').disabled = edit.knot === null;
     }
+    if (mode === 'live' && state.autoShot && !edit) startWatch(); else stopWatch();
     render();
   }
   function setMode(mode) { state.mode = mode; sync(); }
@@ -504,13 +532,18 @@
     pctx.restore();
     photo.hidden = false;
   }
-  // a photo taken with the guide: the hand is where the outline was, so the nails go in its slots
+  // a photo taken with the guide: the hand is about where the outline was. When the guide's lines can be found
+  // in the photo the nails move with them to where the hand really is; otherwise they go in the guide's slots.
+  function place() {
+    var r = fit(greyOf(photo, CW, CH, false), guideSamples());
+    state.found = 'guide';
+    setNails(r.support >= ON ? moved(r) : slots());
+  }
   function shoot() {
     if (!cam.videoWidth) return;
     cover(cam, cam.videoWidth, cam.videoHeight, state.camMirror);
     stopCam();
-    state.found = 'guide';
-    setNails(slots());
+    place();
     setMode('still');
   }
   // a photo from the library was not lined up with the guide, so look for the hand in it.
@@ -521,12 +554,176 @@
       stopCam();
       cover(im, im.naturalWidth, im.naturalHeight, false);
       if (edit) { render(); return; }
-      if (guided) { state.found = 'guide'; setNails(slots()); }
+      if (guided) place();
       setMode('still');
       if (!guided) findHand();
     };
     im.onerror = function () { say(edit ? '底圖讀不進來。可以按「選一張照片」放一張手的照片當底。' : '這張照片讀不進來，換一張試試。', 'warn'); };
     im.src = url;
+  }
+
+  // ---- is the hand on the guide ----
+  // The camera picture is shrunk to a small grey copy, and the guide's lines are moved, turned and resized until
+  // they lie on edges in it. How much of the guide ends on an edge says whether a hand in this pose is there;
+  // how far the guide had to move says where the hand is. It runs on the device and needs no download.
+
+  // points along the guide's lines, one every STEP units, measured from the centre, each with the line's normal there
+  function guideSamples() {
+    if (lock.samples && lock.left === state.leftHand) return lock.samples;
+    var out = [], flip = state.leftHand ? 1 : -1;
+    G.lines.forEach(function (ln) {
+      var pts = [], i, k;
+      for (i = 0; i < ln.length - 1; i++) {
+        var a = ln[Math.max(0, i - 1)], b = ln[i], c = ln[i + 1], e = ln[Math.min(ln.length - 1, i + 2)];
+        var c1 = [b[0] + (c[0] - a[0]) / 6, b[1] + (c[1] - a[1]) / 6], c2 = [c[0] - (e[0] - b[0]) / 6, c[1] - (e[1] - b[1]) / 6];
+        for (k = 0; k < 8; k++) {
+          var t = k / 8, m = 1 - t;
+          pts.push([m * m * m * b[0] + 3 * m * m * t * c1[0] + 3 * m * t * t * c2[0] + t * t * t * c[0],
+                    m * m * m * b[1] + 3 * m * m * t * c1[1] + 3 * m * t * t * c2[1] + t * t * t * c[1]]);
+        }
+      }
+      pts.push(ln[ln.length - 1]);
+      var walked = 0, next = STEP / 2;
+      for (i = 0; i < pts.length - 1; i++) {
+        var dx = pts[i + 1][0] - pts[i][0], dy = pts[i + 1][1] - pts[i][1], d = Math.hypot(dx, dy);
+        if (!d) continue;
+        while (next <= walked + d) {
+          var f = (next - walked) / d;
+          out.push({ x: (pts[i][0] + dx * f - CW / 2) * flip, y: pts[i][1] + dy * f - CH / 2, nx: -dy / d * flip, ny: dx / d });
+          next += STEP;
+        }
+        walked += d;
+      }
+    });
+    lock.samples = out;
+    lock.left = state.leftHand;
+    return out;
+  }
+  // the small grey copy of a picture, filled from its centre the way the stage shows it, lightly blurred
+  function greyOf(src, sw, sh, mirror) {
+    var b = Math.max(GW / sw, GH / sh), dw = sw * b, dh = sh * b;
+    sctx.save();
+    if (mirror) { sctx.translate(GW, 0); sctx.scale(-1, 1); }
+    sctx.drawImage(src, (GW - dw) / 2, (GH - dh) / 2, dw, dh);
+    sctx.restore();
+    var rgba = sctx.getImageData(0, 0, GW, GH).data, n = GW * GH, raw = new Float32Array(n), out = new Float32Array(n), x, y;
+    for (var i = 0; i < n; i++) raw[i] = 0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2];
+    for (y = 0; y < GH; y++) for (x = 0; x < GW; x++) {
+      var x0 = x ? x - 1 : 0, x1 = x < GW - 1 ? x + 1 : x, y0 = y ? y - 1 : 0, y1 = y < GH - 1 ? y + 1 : y;
+      out[y * GW + x] = (raw[y0 * GW + x0] + raw[y0 * GW + x] + raw[y0 * GW + x1] + raw[y * GW + x0] + raw[y * GW + x] + raw[y * GW + x1]
+                       + raw[y1 * GW + x0] + raw[y1 * GW + x] + raw[y1 * GW + x1]) / 9;
+    }
+    return out;
+  }
+  // brightness at a point given in guide units from the centre
+  function lum(g, x, y) {
+    x = (x + CW / 2) / GK - 0.5; y = (y + CH / 2) / GK - 0.5;
+    if (x < 0) x = 0; else if (x > GW - 1.001) x = GW - 1.001;
+    if (y < 0) y = 0; else if (y > GH - 1.001) y = GH - 1.001;
+    var xi = x | 0, yi = y | 0, fx = x - xi, fy = y - yi, q = yi * GW + xi;
+    return (g[q] * (1 - fx) + g[q + 1] * fx) * (1 - fy) + (g[q + GW] * (1 - fx) + g[q + GW + 1] * fx) * fy;
+  }
+  // how strong the edge across a line is at a point: the step in brightness from one side to the other
+  function edge(g, x, y, nx, ny) { return Math.abs(lum(g, x + nx * 6, y + ny * 6) - lum(g, x - nx * 6, y - ny * 6)); }
+  function inFrame(x, y) { return Math.abs(x) < CW / 2 - 8 && Math.abs(y) < CH / 2 - 8; }
+  // M v = r for four unknowns, by elimination
+  function solve4(M, r) {
+    var A = M.map(function (row, i) { return row.concat(r[i]); }), i, j, k;
+    for (i = 0; i < 4; i++) {
+      var top = i;
+      for (j = i + 1; j < 4; j++) if (Math.abs(A[j][i]) > Math.abs(A[top][i])) top = j;
+      var swap = A[i]; A[i] = A[top]; A[top] = swap;
+      if (Math.abs(A[i][i]) < 1e-9) return null;
+      for (j = i + 1; j < 4; j++) { var f = A[j][i] / A[i][i]; for (k = i; k < 5; k++) A[j][k] -= f * A[i][k]; }
+    }
+    var v = [0, 0, 0, 0];
+    for (i = 3; i >= 0; i--) { var sum = A[i][4]; for (k = i + 1; k < 4; k++) sum -= A[i][k] * v[k]; v[i] = sum / A[i][i]; }
+    return v;
+  }
+  // Move, turn and resize the guide about the centre (a point p goes to [a x - b y + tx, b x + a y + ty]) until its
+  // lines lie on edges. Every point looks along its normal for the strongest edge within reach; one least-squares
+  // step then takes each point towards the edge it found. support is the share of the points that end on an edge.
+  function fit(g, samples) {
+    var a = 1, b = 0, tx = 0, ty = 0;
+    for (var pass = 0; pass <= REACH.length; pass++) {
+      var reach = REACH[Math.min(pass, REACH.length - 1)], size = Math.hypot(a, b);
+      var M = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], r = [0, 0, 0, 0];
+      samples.forEach(function (s) {
+        var qx = a * s.x - b * s.y + tx, qy = b * s.x + a * s.y + ty;
+        var nx = (a * s.nx - b * s.ny) / size, ny = (b * s.nx + a * s.ny) / size;
+        if (!inFrame(qx, qy)) return;
+        var best = 0, off = 0;
+        for (var d = -reach; d <= reach; d += GK) {
+          var e = edge(g, qx + nx * d, qy + ny * d, nx, ny) * (1 - 0.35 * Math.abs(d) / reach);   // a nearer edge wins a tie
+          if (e > best) { best = e; off = d; }
+        }
+        if (best < EDGE_MIN) return;
+        var w = Math.min(best, 60), row = [nx * s.x + ny * s.y, -nx * s.y + ny * s.x, nx, ny];
+        for (var i = 0; i < 4; i++) { r[i] += w * row[i] * off; for (var j = 0; j < 4; j++) M[i][j] += w * row[i] * row[j]; }
+      });
+      // a little damping keeps the step small where the edges say little
+      M[0][0] += 4e6; M[1][1] += 4e6; M[2][2] += 20; M[3][3] += 20;
+      var v = solve4(M, r);
+      if (!v) break;
+      a += v[0]; b += v[1]; tx += v[2]; ty += v[3];
+    }
+    var hit = 0, seen = 0, sz = Math.hypot(a, b);
+    samples.forEach(function (s) {
+      var qx = a * s.x - b * s.y + tx, qy = b * s.x + a * s.y + ty;
+      var nx = (a * s.nx - b * s.ny) / sz, ny = (b * s.nx + a * s.ny) / sz;
+      if (!inFrame(qx, qy)) return;
+      seen++;
+      for (var d = -NEAR; d <= NEAR; d += GK) if (edge(g, qx + nx * d, qy + ny * d, nx, ny) >= EDGE_MIN) { hit++; break; }
+    });
+    return { a: a, b: b, tx: tx, ty: ty, size: sz, turn: Math.atan2(b, a) * 180 / Math.PI, support: seen ? hit / seen : 0 };
+  }
+  // the guide's slots, moved the way the fit moved the guide
+  function moved(r) {
+    var out = slots();
+    Object.keys(out).forEach(function (name) {
+      var n = out[name], bx = n.bx - CW / 2, by = n.by - CH / 2, tx = n.tx - CW / 2, ty = n.ty - CH / 2;
+      n.bx = r.a * bx - r.b * by + r.tx + CW / 2; n.by = r.b * bx + r.a * by + r.ty + CH / 2;
+      n.tx = r.a * tx - r.b * ty + r.tx + CW / 2; n.ty = r.b * tx + r.a * ty + r.ty + CH / 2;
+      n.w *= r.size;
+    });
+    return out;
+  }
+  // one look at the camera: is the hand on the guide, and has it stayed there long enough to take the photo
+  function watch() {
+    if (state.mode !== 'live' || cam.readyState < 2 || !cam.videoWidth) return;
+    var now = performance.now(), r = fit(greyOf(cam, cam.videoWidth, cam.videoHeight, state.camMirror), guideSamples());
+    var on = r.support >= ON && Math.abs(r.tx) <= OFF_MAX && Math.abs(r.ty) <= OFF_MAX
+             && Math.abs(r.size - 1) <= SIZE_MAX && Math.abs(r.turn) <= TURN_MAX;
+    // a hand held in the air is never quite still: only a clear move since the last look counts as moving
+    var p = lock.last, steady = p && Math.abs(r.tx - p.tx) < 24 && Math.abs(r.ty - p.ty) < 24 && Math.abs(r.size - p.size) < 0.03;
+    lock.last = r;
+    if (on && steady && now >= lock.armed) { if (!lock.since) lock.since = now; } else lock.since = 0;
+    stage.dataset.lock = on ? 'on' : '';
+    // the fit only says which way to move once enough of the guide has found the hand
+    var text = on ? HINTS.hold : r.support < 0.55 ? HINTS.live
+             : r.size > 1 + SIZE_MAX ? HINTS.farther : r.size < 1 - SIZE_MAX ? HINTS.closer
+             : Math.abs(r.tx) > OFF_MAX && Math.abs(r.tx) >= Math.abs(r.ty) ? (r.tx > 0 ? HINTS.left : HINTS.right)
+             : Math.abs(r.ty) > OFF_MAX ? (r.ty > 0 ? HINTS.up : HINTS.down) : HINTS.near;
+    $('hint').textContent = text + '（對到 ' + Math.round(r.support * 100) + '%）';
+    if (lock.since && now - lock.since >= HOLD) {
+      if (navigator.vibrate) navigator.vibrate(40);
+      shoot();
+      say('對到了，已經自己拍好。位置不對可以點甲片拖，或按「重來」。', 'good');
+    }
+  }
+  function startWatch() {
+    if (lock.timer) return;
+    lock.since = 0; lock.last = null; lock.armed = performance.now() + ARM;
+    lock.timer = setTimeout(function look() {
+      lock.timer = null;
+      try { watch(); } catch (err) { console.warn('watching the camera failed', err); return; }   // the button still works
+      if (state.mode === 'live' && state.autoShot) lock.timer = setTimeout(look, EVERY);
+    }, EVERY);
+  }
+  function stopWatch() {
+    clearTimeout(lock.timer);
+    lock.timer = null;
+    stage.dataset.lock = '';
   }
 
   // ---- result ----
@@ -776,6 +973,11 @@
   $('flipCam').addEventListener('click', function () {
     state.facing = state.facing === 'environment' ? 'user' : 'environment';
     startCam();
+  });
+  $('autoShot').addEventListener('click', function () {
+    state.autoShot = !state.autoShot;
+    try { localStorage.setItem('autoShot', state.autoShot ? '1' : '0'); } catch (e) {}
+    sync();
   });
   $('pick').addEventListener('click', function () {
     if (!edit) loadDetector().catch(function () {});   // start fetching the model while the user chooses
