@@ -321,17 +321,36 @@
     x.fillRect(0, 0, c.width, c.height);
     return c;
   }
+  // the outline drawn for a nail, placed on its slot: null when nobody drew one
+  function outline(name, n) {
+    var shape = G.shapes && G.shapes[name];
+    if (!shape) return null;
+    var q = geo(n), flip = !edit && !state.leftHand ? -1 : 1;      // the right hand is the mirror image
+    return loop(shape.map(function (s) {
+      return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0] * flip, n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0] * flip];
+    }));
+  }
   function paintNails(ctx, nails) {
     ORDER.forEach(function (name) {
       var n = nails[name];
       if (!n || !imgs[name].naturalWidth) return;
-      var g = geo(n);
+      var g = geo(n), d = outline(name, n), grow = 1;
       ctx.save();
-      ctx.translate(g.cx, g.cy);
-      ctx.rotate(g.ang);
       ctx.shadowColor = 'rgba(40, 20, 10, .45)';
       ctx.shadowBlur = Math.max(3, n.w * 0.06); ctx.shadowOffsetX = n.w * 0.015; ctx.shadowOffsetY = n.w * 0.03;
-      ctx.drawImage(lit(name, n), -n.w / 2, -g.len / 2, n.w, g.len);
+      if (d) {
+        // a nail with a drawn outline fills exactly that outline: lay its shadow, then cut the picture to the shape.
+        // The picture is drawn a little larger so its own rounded corners fall outside the cut.
+        var path = new Path2D(d);
+        ctx.fillStyle = 'rgb(60, 40, 34)';
+        if (ctx.globalAlpha === 1) ctx.fill(path);      // no shadow under the see-through nails of the live view
+        ctx.shadowColor = 'transparent';
+        ctx.clip(path);
+        grow = 1.3;
+      }
+      ctx.translate(g.cx, g.cy);
+      ctx.rotate(g.ang);
+      ctx.drawImage(lit(name, n), -n.w * grow / 2, -g.len * grow / 2, n.w * grow, g.len * grow);
       ctx.restore();
     });
   }
@@ -358,16 +377,16 @@
   // a nail without a drawn outline gets a rounded box.
   function drawFrames() {
     var g = $('frames'), show = state.mode !== 'still' || !!edit, where = edit ? state.nails : slots();
-    var flip = !edit && !state.leftHand ? -1 : 1;      // the right hand is the mirror image
     g.toggleAttribute('hidden', !show);
     if (!show) return;
     ORDER.forEach(function (name, i) {
       var n = where[name], d = '';
       if (n) {
-        var q = geo(n), shape = (G.shapes && G.shapes[name]) || BOX;
-        d = loop(shape.map(function (s) {
-          return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0] * flip, n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0] * flip];
-        }));
+        d = outline(name, n);
+        if (!d) {
+          var q = geo(n);
+          d = loop(BOX.map(function (s) { return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0], n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0]]; }));
+        }
       }
       ['under', 'dash'].forEach(function (kind, k) {
         var el = g.children[i * 2 + k] || g.appendChild(document.createElementNS(NS, 'path'));
