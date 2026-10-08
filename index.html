@@ -54,6 +54,10 @@
   /* --z is the view's zoom: lines keep the same thickness on screen however far it is zoomed in */
   .hand .under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
   .hand .dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
+  /* where each nail goes: a blue dashed frame, like the ones drawn on the pose photo */
+  .slot { fill: none; vector-effect: non-scaling-stroke; }
+  .slot.under { stroke: rgba(0, 0, 0, .45); stroke-width: calc(4px / var(--z, 1)); }
+  .slot.dash { stroke: #7db8ff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(6px / var(--z, 1)) calc(5px / var(--z, 1)); }
   .axis {
     stroke: #fff; stroke-width: calc(1.5px / var(--z, 1)); stroke-dasharray: calc(4px / var(--z, 1)) calc(4px / var(--z, 1));
     vector-effect: non-scaling-stroke; fill: none; opacity: .85;
@@ -107,6 +111,7 @@
     <canvas id="paint" width="1200" height="1600"></canvas>
     <svg id="overlay" viewBox="0 0 1200 1600" role="img" aria-label="手的虛線輪廓和五片甲片；拍照後，選中的那片有三個可以拖的點">
       <g class="hand" id="hand"><path class="under"/><path class="dash"/></g>
+      <g id="frames"></g>
       <g id="knots" hidden></g>
       <circle class="ghost" id="ghost" hidden/>
       <g id="grips" hidden>
@@ -167,7 +172,7 @@
   var CW = G.w, CH = G.h;
   var VISION = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
   var MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-  var POSE = '../src/hand_claw.webp';   // the photo the guide was traced from; it only exists on the machine that built it
+  var POSE = G.pose;   // the photo the guide belongs to; it only exists on the machine that built it
   // where a press-on starts and ends along the last finger segment (last joint = 0, fingertip landmark = 1),
   // and how much wider than the natural nail it is. With the fingers curled towards the camera the fingertip
   // landmark tends to land short of the real fingertip, so the nail reaches well past it.
@@ -175,7 +180,7 @@
   var ZOOM = 2.2;
   var HINTS = {
     idle: '這是引導畫面。開相機後，把手擺成虛線的樣子。',
-    live: '手心朝自己、手指往內彎，放進虛線。指甲對到甲片就拍。',
+    live: '手心朝自己、手指往內彎，放進虛線。指甲對到藍色框就拍。',
     finding: '正在找你的手…',
     guide: '點一片甲片就會放大，可以拖到剛好。',
     found: '位置是估的。點一片甲片就會放大，可以拖。',
@@ -334,10 +339,34 @@
     return { base: { x: n.bx - g.ux * o, y: n.by - g.uy * o }, tip: { x: n.tx + g.ux * o, y: n.ty + g.uy * o },
              side: { x: g.cx - g.uy * half, y: g.cy + g.ux * half }, mid: { x: g.cx, y: g.cy } };
   }
+  // the blue frames of the guide: one per nail, in the guide's slots (or, in the editor, wherever they were moved)
+  function drawFrames() {
+    var g = $('frames'), show = state.mode !== 'still' || !!edit, where = edit ? state.nails : slots();
+    g.toggleAttribute('hidden', !show);
+    if (!show) return;
+    ORDER.forEach(function (name, i) {
+      var n = where[name];
+      ['under', 'dash'].forEach(function (kind, k) {
+        var el = g.children[i * 2 + k] || g.appendChild(document.createElementNS(NS, 'rect'));
+        el.setAttribute('class', 'slot ' + kind);
+        el.toggleAttribute('hidden', !n);
+        if (!n) return;
+        var q = geo(n);
+        el.setAttribute('transform', 'translate(' + q.cx.toFixed(1) + ' ' + q.cy.toFixed(1) + ') rotate(' + (q.ang * 180 / Math.PI).toFixed(1) + ')');
+        el.setAttribute('x', -n.w / 2); el.setAttribute('y', -q.len / 2);
+        el.setAttribute('width', n.w); el.setAttribute('height', q.len);
+        el.setAttribute('rx', Math.min(n.w, q.len) * 0.3);
+      });
+    });
+  }
   function render() {
     xctx.clearRect(0, 0, CW, CH);
+    // over the live camera the nails are see-through, so the real nails can be lined up with the frames
+    xctx.globalAlpha = state.mode === 'live' ? 0.5 : 1;
     if (state.mode !== 'still') paintNails(xctx, slots());
     else if (state.show) paintNails(xctx, state.nails);
+    xctx.globalAlpha = 1;
+    drawFrames();
     if (edit) drawKnots();
     var n = state.show && state.selected && state.nails[state.selected];
     $('grips').toggleAttribute('hidden', !n);
