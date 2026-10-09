@@ -9,9 +9,9 @@
 <!--
   Test page for trying press-ons on from one photo. A dashed outline traced from a real hand shows the
   pose; the user lines their hand up with it, so the nails can sit in fixed slots. Every nail then has
-  three points the user can drag to fix it. While the camera is on, the page checks whether the hand is on the
-  guide (the guide's lines fitted to the edges in the picture) and then takes the photo by itself; the same fit
-  moves the nails to where the hand really was. For a photo taken elsewhere, the page can look for the hand
+  three points the user can drag to fix it. Round the guide's lines lies a lighter band: while the camera is on,
+  the page fits the guide to the edges in the picture, and once the hand's edges are inside the band it takes the
+  photo by itself; the same fit moves the nails to where the hand really was. For a photo taken elsewhere, the page can look for the hand
   itself (MediaPipe hand landmarks, run in the browser). data.js and nails/*.png come from ../make_guide.py.
 
   ?edit opens the guide editor: drag the outline's nodes, add or remove nodes, and move the nail slots
@@ -56,6 +56,9 @@
   /* --z is the view's zoom: lines keep the same thickness on screen however far it is zoomed in */
   .hand .under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
   .hand .dash { stroke: #fff; stroke-width: calc(2px / var(--z, 1)); stroke-dasharray: calc(7px / var(--z, 1)) calc(7px / var(--z, 1)); }
+  /* the band round the lines: the hand's edge only has to fall inside it (its width is set from BAND in the script) */
+  .hand .zone { stroke: rgba(255, 255, 255, .17); vector-effect: none; }
+  .editing .hand .zone, .stage[data-mode="idle"] .hand .zone { display: none; }
   /* where each nail goes: a dashed frame drawn like the hand's lines; blue only in the editor, to tell them apart */
   .slot { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
   .slot.under { stroke: rgba(0, 0, 0, .4); stroke-width: calc(4.5px / var(--z, 1)); }
@@ -63,6 +66,7 @@
   .editing .slot.dash { stroke: #7db8ff; }
   /* the hand is on the guide and the photo is about to be taken */
   .stage[data-lock="on"] .hand .dash, .stage[data-lock="on"] .slot.dash { stroke: #8df0b0; }
+  .stage[data-lock="on"] .hand .zone { stroke: rgba(141, 240, 176, .22); }
   .axis {
     stroke: #fff; stroke-width: calc(1.5px / var(--z, 1)); stroke-dasharray: calc(4px / var(--z, 1)) calc(4px / var(--z, 1));
     vector-effect: non-scaling-stroke; fill: none; opacity: .85;
@@ -115,7 +119,7 @@
     <canvas id="photo" width="1200" height="1600" hidden></canvas>
     <canvas id="paint" width="1200" height="1600"></canvas>
     <svg id="overlay" viewBox="0 0 1200 1600" role="img" aria-label="手的虛線輪廓和五片甲片；拍照後，選中的那片有三個可以拖的點">
-      <g class="hand" id="hand"><path class="under"/><path class="dash"/></g>
+      <g class="hand" id="hand"><path class="zone"/><path class="under"/><path class="dash"/></g>
       <g id="frames"></g>
       <g id="knots" hidden></g>
       <circle class="ghost" id="ghost" hidden/>
@@ -188,14 +192,20 @@
   var BOX = [[-0.5, 0.25], [-0.32, 0.03], [0, 0], [0.32, 0.03], [0.5, 0.25], [0.5, 0.75], [0.32, 0.97], [0, 1], [-0.32, 0.97], [-0.5, 0.75]];
   // "the hand is on the guide": the guide's lines are fitted to the edges in a small grey copy of the camera picture
   var GW = 300, GH = 400, GK = CW / GW;               // the grey copy, and how many guide units one of its pixels covers
-  var STEP = 14, EDGE_MIN = 10;                       // a point every STEP units; the least step in brightness that counts as an edge
-  var REACH = [64, 28], NEAR = 12;                    // how far a point looks for its edge, pass by pass; how near counts as "on" it
-  var ON = 0.72;                                      // share of the guide that has to lie on edges
-  var OFF_MAX = 48, SIZE_MAX = 0.07, TURN_MAX = 6;    // how far off the hand may be: units, share of its size, degrees
-  var HOLD = 600, ARM = 1200, EVERY = 90;             // ms: stay on the guide this long; wait after the camera starts; between looks
+  var STEP = 14;                                      // a point every STEP units along the guide's lines
+  // the least step in brightness that counts as an edge: a share of the picture's own clear edges, kept within
+  // limits, so a dim or soft picture is judged the way a crisp one is
+  var EDGE_SHARE = 0.3, EDGE_LOW = 4, EDGE_TOP = 10;
+  // how far a point looks for its edge, step by step of the fit: wide at first, since a nail far from the centre
+  // moves a long way when the hand is a little turned or a little too big
+  var REACH = [90, 80, 64, 64, 48, 48, 40, 40, 28, 28, 28, 28];
+  var BAND = 36;                                      // the hand's edge may be this far from the guide's line and still count
+  var ON = 0.74;                                      // share of the guide that has to have an edge inside its band
+  var OFF_MAX = 70, SIZE_MAX = 0.10, TURN_MAX = 8;    // how far off the whole hand may be: units, share of its size, degrees
+  var HOLD = 500, ARM = 1200, EVERY = 90;             // ms: stay on the guide this long; wait after the camera starts; between looks
   var HINTS = {
     idle: '這是引導畫面。開相機後，把手擺成虛線的樣子。',
-    live: '手心朝自己、手指往內彎，放進虛線。對到了會自己拍。',
+    live: '手心朝自己、手指往內彎。手的邊緣進到亮帶裡就會自己拍。',
     manual: '手心朝自己、手指往內彎，放進虛線。指甲對到指甲的框就拍。',
     near: '快對到了，再調一點。',
     closer: '手再靠近一點。', farther: '手再遠一點。',
@@ -324,6 +334,7 @@
   function drawGuide() {
     var d = G.lines.map(curve).join(' ');
     Array.prototype.forEach.call(document.querySelectorAll('#hand path'), function (el) { el.setAttribute('d', d); });
+    document.querySelector('#hand .zone').setAttribute('stroke-width', BAND * 2);
   }
   // the nail image, darkened or lightened to the light on that fingertip and tinted a little by its colour
   function lit(name, n) {
@@ -451,7 +462,7 @@
     $('flipHand').hidden = still;
     $('flipCam').hidden = mode !== 'live';
     $('autoLine').hidden = mode !== 'live';
-    $('autoText').textContent = state.autoShot ? '手對到虛線、停住，就會自己拍。' : '自動拍已關，要自己按「拍照」。';
+    $('autoText').textContent = state.autoShot ? '手的邊緣進到亮帶裡、停住，就會自己拍。' : '自動拍已關，要自己按「拍照」。';
     $('autoShot').textContent = state.autoShot ? '關掉自動拍' : '打開自動拍';
     $('pick').hidden = still && !edit;
     $('retake').hidden = !still || !!edit;
@@ -640,13 +651,24 @@
     for (i = 3; i >= 0; i--) { var sum = A[i][4]; for (k = i + 1; k < 4; k++) sum -= A[i][k] * v[k]; v[i] = sum / A[i][i]; }
     return v;
   }
+  // how strong this picture's clear edges are: the step in brightness that only a tenth of the picture exceeds
+  function strong(g) {
+    var v = [], x, y;
+    for (y = 3; y < GH - 3; y += 3) for (x = 3; x < GW - 3; x += 3) {
+      var q = y * GW + x;
+      v.push(Math.max(Math.abs(g[q + 3] - g[q - 3]), Math.abs(g[q + 3 * GW] - g[q - 3 * GW])));
+    }
+    v.sort(function (a, b) { return a - b; });
+    return v[Math.floor(v.length * 0.9)];
+  }
   // Move, turn and resize the guide about the centre (a point p goes to [a x - b y + tx, b x + a y + ty]) until its
   // lines lie on edges. Every point looks along its normal for the strongest edge within reach; one least-squares
-  // step then takes each point towards the edge it found. support is the share of the points that end on an edge.
+  // step then takes each point towards the edge it found. A hand never has quite the guide's shape, so what is
+  // counted afterwards is the band: support is the share of the points with an edge no further than BAND away.
   function fit(g, samples) {
-    var a = 1, b = 0, tx = 0, ty = 0;
-    for (var pass = 0; pass <= REACH.length; pass++) {
-      var reach = REACH[Math.min(pass, REACH.length - 1)], size = Math.hypot(a, b);
+    var a = 1, b = 0, tx = 0, ty = 0, least = Math.max(EDGE_LOW, Math.min(EDGE_TOP, EDGE_SHARE * strong(g)));
+    for (var pass = 0; pass < REACH.length; pass++) {
+      var reach = REACH[pass], size = Math.hypot(a, b);
       var M = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], r = [0, 0, 0, 0];
       samples.forEach(function (s) {
         var qx = a * s.x - b * s.y + tx, qy = b * s.x + a * s.y + ty;
@@ -657,12 +679,12 @@
           var e = edge(g, qx + nx * d, qy + ny * d, nx, ny) * (1 - 0.35 * Math.abs(d) / reach);   // a nearer edge wins a tie
           if (e > best) { best = e; off = d; }
         }
-        if (best < EDGE_MIN) return;
-        var w = Math.min(best, 60), row = [nx * s.x + ny * s.y, -nx * s.y + ny * s.x, nx, ny];
+        if (best < least) return;
+        var w = Math.min(best, 6 * least), row = [nx * s.x + ny * s.y, -nx * s.y + ny * s.x, nx, ny];
         for (var i = 0; i < 4; i++) { r[i] += w * row[i] * off; for (var j = 0; j < 4; j++) M[i][j] += w * row[i] * row[j]; }
       });
       // a little damping keeps the step small where the edges say little
-      M[0][0] += 4e6; M[1][1] += 4e6; M[2][2] += 20; M[3][3] += 20;
+      M[0][0] += 4e5 * least; M[1][1] += 4e5 * least; M[2][2] += 2 * least; M[3][3] += 2 * least;
       var v = solve4(M, r);
       if (!v) break;
       a += v[0]; b += v[1]; tx += v[2]; ty += v[3];
@@ -673,7 +695,9 @@
       var nx = (a * s.nx - b * s.ny) / sz, ny = (b * s.nx + a * s.ny) / sz;
       if (!inFrame(qx, qy)) return;
       seen++;
-      for (var d = -NEAR; d <= NEAR; d += GK) if (edge(g, qx + nx * d, qy + ny * d, nx, ny) >= EDGE_MIN) { hit++; break; }
+      for (var d = 0; d <= BAND; d += GK) {
+        if (edge(g, qx + nx * d, qy + ny * d, nx, ny) >= least || edge(g, qx - nx * d, qy - ny * d, nx, ny) >= least) { hit++; break; }
+      }
     });
     return { a: a, b: b, tx: tx, ty: ty, size: sz, turn: Math.atan2(b, a) * 180 / Math.PI, support: seen ? hit / seen : 0 };
   }
@@ -700,13 +724,13 @@
     if (on && steady && now >= lock.armed) { if (!lock.since) lock.since = now; } else lock.since = 0;
     stage.dataset.lock = on ? 'on' : '';
     // the fit only says which way to move once enough of the guide has found the hand
-    var text = on ? HINTS.hold : r.support < 0.55 ? HINTS.live
+    var text = on ? HINTS.hold : r.support < 0.64 ? HINTS.live
              : r.size > 1 + SIZE_MAX ? HINTS.farther : r.size < 1 - SIZE_MAX ? HINTS.closer
              : Math.abs(r.tx) > OFF_MAX && Math.abs(r.tx) >= Math.abs(r.ty) ? (r.tx > 0 ? HINTS.left : HINTS.right)
              : Math.abs(r.ty) > OFF_MAX ? (r.ty > 0 ? HINTS.up : HINTS.down) : HINTS.near;
     $('hint').textContent = text + '（對到 ' + Math.round(r.support * 100) + '%）';
     if (lock.since && now - lock.since >= HOLD) {
-      if (navigator.vibrate) navigator.vibrate(40);
+      try { navigator.vibrate(40); } catch (e) {}      // a short buzz where the phone has one
       shoot();
       say('對到了，已經自己拍好。位置不對可以點甲片拖，或按「重來」。', 'good');
     }
