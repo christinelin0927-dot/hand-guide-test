@@ -336,30 +336,86 @@
     Array.prototype.forEach.call(document.querySelectorAll('#hand path'), function (el) { el.setAttribute('d', d); });
     document.querySelector('#hand .zone').setAttribute('stroke-width', BAND * 2);
   }
-  // the nail image, darkened or lightened to the light on that fingertip and tinted a little by its colour
+  function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+  // The light on a fingertip, read from the photo under the nail: how bright and what colour it is there (f, R, G, B),
+  // and where on the real nail the light catches (u across, -0.5 .. 0.5 from its middle; v along, 0 = cuticle).
+  // Without a photo the light comes from a little to one side, as it does for most people holding a phone.
+  function lightAt(n) {
+    var g = geo(n), out = { f: 1, R: 255, G: 250, B: 245, u: -0.16, v: 0.36 };
+    if (state.mode !== 'still' || photo.hidden) return out;
+    var r = Math.ceil(Math.max(n.w, g.len) * 0.6);
+    var x0 = clamp(Math.round(g.cx - r), 0, CW - 2), y0 = clamp(Math.round(g.cy - r), 0, CH - 2);
+    var w = Math.min(r * 2, CW - x0), h = Math.min(r * 2, CH - y0), d = pctx.getImageData(x0, y0, w, h).data;
+    var pts = [], R = 0, G = 0, B = 0, sum = 0;
+    for (var j = 0; j < 9; j++) for (var i = 0; i < 9; i++) {
+      var u = (i - 4) / 10, v = 0.14 + j * 0.09;      // a grid over the middle of the nail, in its own measure
+      var px = Math.round(n.bx + g.ux * g.len * v + g.uy * n.w * u) - x0, py = Math.round(n.by + g.uy * g.len * v - g.ux * n.w * u) - y0;
+      if (px < 0 || py < 0 || px >= w || py >= h) continue;
+      var q = (py * w + px) * 4, L = 0.299 * d[q] + 0.587 * d[q + 1] + 0.114 * d[q + 2];
+      pts.push([u, v, L]); R += d[q]; G += d[q + 1]; B += d[q + 2]; sum += L;
+    }
+    if (!pts.length) return out;
+    var k = pts.length, mean = sum / k, weight = 0, us = 0, vs = 0;
+    pts.forEach(function (q) {
+      var e = q[2] - mean;
+      if (e > 0) { e *= e; weight += e; us += e * q[0]; vs += e * q[1]; }
+    });
+    // a glossy shell picks up light even in the shade, so it is never shown much darker than its design
+    out.f = clamp(0.4 + 0.6 * mean / 165, 0.76, 1.12); out.R = R / k; out.G = G / k; out.B = B / k;
+    // only a clear highlight says where the light is; an evenly lit nail keeps the usual side
+    if (weight > k * 20) { out.u = clamp(us / weight, -0.26, 0.26); out.v = clamp(vs / weight, 0.26, 0.58); }
+    return out;
+  }
+  // The nail's picture with the light put on it. A press-on is an arched, glossy shell, and a flat picture of its
+  // design reads as paper: so the sides are turned away from the light, both ends dip a little, and a soft streak
+  // with a small sharp glint sits where the light catches. Brightness, colour and the side the light comes from
+  // are taken from the photo. Everything is laid on with source-atop, so only the nail's own pixels change.
   function lit(name, n) {
     var im = imgs[name], c = tints[name] || (tints[name] = document.createElement('canvas'));
-    c.width = im.naturalWidth; c.height = im.naturalHeight;
-    var x = c.getContext('2d'), g = geo(n), r = Math.max(6, Math.round(n.w * 0.3));
+    var W = c.width = im.naturalWidth, H = c.height = im.naturalHeight, x = c.getContext('2d'), L = lightAt(n), gr;
+    c.light = L;
     x.drawImage(im, 0, 0);
-    if (state.mode !== 'still' || photo.hidden) return c;
-    var x0 = Math.min(CW - 2, Math.max(0, Math.round(g.cx - r))), y0 = Math.min(CH - 2, Math.max(0, Math.round(g.cy - r)));
-    var d = pctx.getImageData(x0, y0, Math.min(r * 2, CW - x0), Math.min(r * 2, CH - y0)).data, R = 0, G = 0, B = 0;
-    for (var i = 0; i < d.length; i += 4) { R += d[i]; G += d[i + 1]; B += d[i + 2]; }
-    var k = 4 / d.length;
-    R *= k; G *= k; B *= k;
-    var f = Math.min(1.12, Math.max(0.55, (0.299 * R + 0.587 * G + 0.114 * B) / 165));
     x.globalCompositeOperation = 'source-atop';
-    x.fillStyle = f < 1 ? 'rgba(20,12,8,' + (1 - f).toFixed(3) + ')' : 'rgba(255,248,240,' + ((f - 1) * 0.9).toFixed(3) + ')';
-    x.fillRect(0, 0, c.width, c.height);
-    x.fillStyle = 'rgba(' + Math.round(R) + ',' + Math.round(G) + ',' + Math.round(B) + ',0.08)';
-    x.fillRect(0, 0, c.width, c.height);
+    function wash(style) { x.fillStyle = style; x.fillRect(0, 0, W, H); }
+    wash(L.f < 1 ? 'rgba(20,12,8,' + (1 - L.f).toFixed(3) + ')' : 'rgba(255,248,240,' + ((L.f - 1) * 0.9).toFixed(3) + ')');
+    wash('rgba(' + Math.round(L.R) + ',' + Math.round(L.G) + ',' + Math.round(L.B) + ',0.08)');
+    // across: the arch. The brightest line sits towards the light, the far side falls off more
+    var mid = 0.5 + L.u * 0.7, dark = 'rgba(22,10,8,';
+    gr = x.createLinearGradient(0, 0, W, 0);
+    gr.addColorStop(0, dark + (L.u > 0 ? 0.56 : 0.42) + ')');
+    gr.addColorStop(clamp(mid - 0.30, 0.05, 0.9), dark + '0.17)');
+    gr.addColorStop(mid, dark + '0)');
+    gr.addColorStop(clamp(mid + 0.30, 0.1, 0.95), dark + '0.17)');
+    gr.addColorStop(1, dark + (L.u > 0 ? 0.42 : 0.56) + ')');
+    wash(gr);
+    // along: it dips towards the cuticle and rolls over at the free edge
+    gr = x.createLinearGradient(0, 0, 0, H);
+    gr.addColorStop(0, dark + '0.34)'); gr.addColorStop(0.2, dark + '0.04)'); gr.addColorStop(0.5, dark + '0)');
+    gr.addColorStop(0.8, dark + '0.05)'); gr.addColorStop(1, dark + '0.32)');
+    wash(gr);
+    // the gloss: stronger in a bright place, hardly there in a dim one
+    var shine = clamp(0.30 + (L.f - 0.55) * 0.55, 0.34, 0.62);
+    function glow(cx, cy, rx, ry, alpha, crisp) {      // crisp: how far out the light stays near full strength
+      alpha = Math.min(alpha, 0.92);
+      x.save();
+      x.translate(cx * W, cy * H); x.scale(rx * W, ry * H);
+      var rg = x.createRadialGradient(0, 0, 0, 0, 0, 1);
+      rg.addColorStop(0, 'rgba(255,255,255,' + alpha.toFixed(3) + ')');
+      rg.addColorStop(crisp, 'rgba(255,255,255,' + (alpha * (crisp > 0.5 ? 0.85 : 0.42)).toFixed(3) + ')');
+      rg.addColorStop(1, 'rgba(255,255,255,0)');
+      x.fillStyle = rg;
+      x.beginPath(); x.arc(0, 0, 1, 0, Math.PI * 2); x.fill();
+      x.restore();
+    }
+    glow(0.5 + L.u, L.v + 0.06, 0.16, 0.38, shine * 1.15, 0.45);              // the long soft streak
+    glow(0.5 + L.u * 1.08, L.v - 0.07, 0.05, 0.085, shine * 1.7, 0.62);       // the glint in it, with a harder edge
+    glow(0.5 - L.u * 1.7, 0.62, 0.07, 0.24, shine * 0.24, 0.45);              // a faint answer from the other side
+    x.globalCompositeOperation = 'source-over';
     return c;
   }
-  // the outline drawn for a nail, placed on its slot: null when nobody drew one
+  // the outline drawn for a nail, placed on its slot; a nail nobody drew an outline for gets the rounded box
   function outline(name, n) {
-    var shape = G.shapes && G.shapes[name];
-    if (!shape) return null;
+    var shape = (G.shapes && G.shapes[name]) || BOX;
     var q = geo(n), flip = !edit && !state.leftHand ? -1 : 1;      // the right hand is the mirror image
     return loop(shape.map(function (s) {
       return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0] * flip, n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0] * flip];
@@ -369,23 +425,49 @@
     ORDER.forEach(function (name) {
       var n = nails[name];
       if (!n || !imgs[name].naturalWidth) return;
-      var g = geo(n), d = outline(name, n), grow = 1;
+      var g = geo(n), path = new Path2D(outline(name, n)), pic = lit(name, n), L = pic.light;
+      // a picture that is the design alone fills the outline's own box; a cut-out is drawn larger so that its
+      // own rounded corners fall outside the cut
+      var grow = NAILS[name].flat ? 1.02 : 1.3;
+      var solid = ctx.globalAlpha === 1;      // the see-through nails of the live view get no shadows
+      // which way the light comes from across the nail, as a direction in the picture
+      var lx = g.uy * (L.u < 0 ? -1 : 1), ly = -g.ux * (L.u < 0 ? -1 : 1);
       ctx.save();
-      ctx.shadowColor = 'rgba(40, 20, 10, .45)';
-      ctx.shadowBlur = Math.max(3, n.w * 0.06); ctx.shadowOffsetX = n.w * 0.015; ctx.shadowOffsetY = n.w * 0.03;
-      if (d) {
-        // a nail with a drawn outline fills exactly that outline: lay its shadow, then cut the picture to the shape.
-        // The picture is drawn a little larger so its own rounded corners fall outside the cut.
-        var path = new Path2D(d);
+      if (solid) {
+        // where the shell meets the finger: a tight dark line under its edge, and a wider soft shade away from the light
         ctx.fillStyle = 'rgb(60, 40, 34)';
-        if (ctx.globalAlpha === 1) ctx.fill(path);      // no shadow under the see-through nails of the live view
+        ctx.shadowColor = 'rgba(30, 12, 6, .30)';
+        ctx.shadowBlur = n.w * 0.16; ctx.shadowOffsetX = -lx * n.w * 0.035; ctx.shadowOffsetY = -ly * n.w * 0.035;
+        ctx.fill(path);
+        ctx.shadowColor = 'rgba(30, 12, 6, .40)';
+        ctx.shadowBlur = Math.max(2, n.w * 0.03); ctx.shadowOffsetX = -lx * n.w * 0.012; ctx.shadowOffsetY = -ly * n.w * 0.012;
+        ctx.fill(path);
         ctx.shadowColor = 'transparent';
-        ctx.clip(path);
-        grow = 1.3;
       }
+      ctx.clip(path);
+      ctx.save();
       ctx.translate(g.cx, g.cy);
       ctx.rotate(g.ang);
-      ctx.drawImage(lit(name, n), -n.w * grow / 2, -g.len * grow / 2, n.w * grow, g.len * grow);
+      ctx.drawImage(pic, -n.w * grow / 2, -g.len * grow / 2, n.w * grow, g.len * grow);
+      ctx.restore();
+      if (solid && Path2D.prototype.addPath) {
+        // the rim: the shell curves down all round, most on the side away from the light. It is the shadow of
+        // everything outside the nail, falling inwards (the shape that casts it is hidden by the cut).
+        var out = new Path2D(), far = Math.max(n.w, g.len) * 2;
+        out.rect(g.cx - far, g.cy - far, far * 2, far * 2);
+        out.addPath(path);
+        ctx.shadowColor = 'rgba(24, 10, 6, .5)';
+        ctx.shadowBlur = n.w * 0.11; ctx.shadowOffsetX = lx * n.w * 0.02; ctx.shadowOffsetY = ly * n.w * 0.02;
+        ctx.fill(out, 'evenodd');
+        // and the edge that faces the light catches it: a fine bright line just inside the outline on that side
+        var edge = ctx.createLinearGradient(g.cx + lx * n.w * 0.5, g.cy + ly * n.w * 0.5, g.cx + lx * n.w * 0.12, g.cy + ly * n.w * 0.12);
+        edge.addColorStop(0, 'rgba(255, 255, 255, .32)');
+        edge.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.shadowColor = 'transparent';
+        ctx.strokeStyle = edge;
+        ctx.lineWidth = Math.max(2, n.w * 0.024);      // half of it lies outside the cut
+        ctx.stroke(path);
+      }
       ctx.restore();
     });
   }
@@ -408,8 +490,7 @@
     return d + 'Z';
   }
   // the frames of the guide: one per nail, in the guide's slots (or, in the editor, wherever they were moved).
-  // A frame is the outline that was drawn for that nail, kept in the slot's own measure so it moves with the slot;
-  // a nail without a drawn outline gets a rounded box.
+  // A frame is the outline that was drawn for that nail, kept in the slot's own measure so it moves with the slot.
   function drawFrames() {
     var g = $('frames'), show = state.mode !== 'still' || !!edit, where = edit ? state.nails : slots();
     g.toggleAttribute('hidden', !show);
@@ -418,10 +499,6 @@
       var n = where[name], d = '';
       if (n) {
         d = outline(name, n);
-        if (!d) {
-          var q = geo(n);
-          d = loop(BOX.map(function (s) { return [n.bx + q.ux * q.len * s[1] - q.uy * n.w * s[0], n.by + q.uy * q.len * s[1] + q.ux * n.w * s[0]]; }));
-        }
       }
       ['under', 'dash'].forEach(function (kind, k) {
         var el = g.children[i * 2 + k] || g.appendChild(document.createElementNS(NS, 'path'));
